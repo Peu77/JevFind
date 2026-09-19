@@ -1,0 +1,11 @@
+[package]
+name = "jev-code-finder"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+
+[dependencies]
+clap = { version = "=4.5.32", features = ["derive"] }
+ignore = "=0.4.23"
+reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"] }
+serde_json = "1"

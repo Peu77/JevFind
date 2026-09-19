@@ -9,6 +9,8 @@ use std::{
     fs,
     io::{self, Write},
     path::{Path, PathBuf},
+    thread,
+    time::Duration,
 };
 
 #[derive(Parser, Debug)]
@@ -34,11 +36,19 @@ struct Args {
     /// Include hidden files and directories
     #[arg(long)]
     hidden: bool,
+    /// Maximum number of files scanned concurrently
+    #[arg(long, default_value_t = 10)]
+    parallelism: usize,
 }
 
 const WINDOW: usize = 100;
 const OVERLAP: usize = 20;
+const MAX_WINDOW_BYTES: usize = 12_000;
+const MAX_REQUEST_SOURCE_BYTES: usize = 24_000;
+const MAX_WINDOWS_PER_REQUEST: usize = 24;
 const FILE_BATCH: usize = 200;
+const MAX_RETRIES: usize = 3;
+const API_URL: &str = "https://api.typesafe.ai/v1/systemone";
 const RESET: &str = "\x1b[0m";
 const SKIP_DIRS: &[&str] = &[
     ".git",
@@ -62,6 +72,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     {
         return Err("thresholds must be between 0 and 1".into());
     }
+    if args.parallelism == 0 {
+        return Err("parallelism must be at least 1".into());
+    }
     let key = env::var("TYPESAFE_API_KEY").map_err(|_| "TYPESAFE_API_KEY is required")?;
     let client = Client::new();
     let candidates = code_files(&args.path, args.hidden)?;
@@ -75,85 +88,55 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut found = false;
     let mut results = Vec::new();
 
-    for (file, path_probability) in files {
+    for batch in files.chunks(args.parallelism) {
         if let Some(tree) = debug.as_mut() {
-            tree.set(&file, FileStatus::Scanning(path_probability))?;
+            for (file, path_probability) in batch {
+                tree.set(file, FileStatus::Scanning(*path_probability))?;
+            }
         }
-        let text = match fs::read_to_string(&file) {
-            Ok(text) => text,
-            Err(_) => {
+        let scans = thread::scope(|scope| {
+            let handles: Vec<_> = batch
+                .iter()
+                .map(|(file, path_probability)| {
+                    scope.spawn(|| scan_file(&client, &key, &args, file, *path_probability))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .map_err(|_| "file scan worker panicked".to_string())?
+                })
+                .collect::<Result<Vec<_>, String>>()
+        })
+        .map_err(io::Error::other)?;
+
+        for scan in scans {
+            if scan.unreadable {
                 if let Some(tree) = debug.as_mut() {
-                    tree.set(&file, FileStatus::Unreadable(path_probability))?;
+                    tree.set(&scan.file, FileStatus::Unreadable(scan.path_probability))?;
                 }
                 continue;
             }
-        };
-        let windows = windows(&text);
-        if windows.is_empty() {
-            if let Some(tree) = debug.as_mut() {
-                tree.set(&file, FileStatus::NoMatch(path_probability))?;
-            }
-            continue;
-        }
-
-        let mut questions = serde_json::Map::new();
-        for (i, (start, end, _snippet)) in windows.iter().enumerate() {
-            questions.insert(
-                format!("window_{i}"),
-                json!({
-                    "type": "noul",
-                    "instructions": format!(
-                        "Does file {} lines {}-{} contain, implement, configure, call, or enforce {}? Return yes only when that line range is materially relevant.",
-                        file.display(), start, end, args.concept
-                    )
-                }),
-            );
-        }
-
-        let body = json!({
-            "model": args.model,
-            "state": format!("Repository file: {}\n\n{}", file.display(), text),
-            "questions": questions,
-        });
-        let response: Value = client
-            .post("https://api.typesafe.ai/v1/systemone")
-            .bearer_auth(&key)
-            .json(&body)
-            .send()?
-            .error_for_status()?
-            .json()?;
-
-        let mut best_match: f64 = 0.0;
-        for (i, (start, end, snippet)) in windows.iter().enumerate() {
-            let answer = response
-                .get("answers")
-                .and_then(|answers| answers.get(format!("window_{i}")))
-                .unwrap_or(&Value::Null);
-            let probability = noul_probability(answer);
-            best_match = best_match.max(probability);
-            if probability >= args.threshold {
+            if !scan.matches.is_empty() {
                 found = true;
-                let result = format!(
-                    "{}:{}-{} ({:.0}%)",
-                    file.display(),
-                    start,
-                    end,
-                    probability * 100.0
-                );
                 if args.debug {
-                    results.push(format!("{result}\n{snippet}\n"));
+                    results.extend(scan.matches);
                 } else {
-                    println!("{result}\n{snippet}\n");
+                    for result in scan.matches {
+                        println!("{result}");
+                    }
                 }
             }
-        }
-        if let Some(tree) = debug.as_mut() {
-            let status = if best_match >= args.threshold {
-                FileStatus::Found(path_probability, best_match)
-            } else {
-                FileStatus::NoMatch(path_probability)
-            };
-            tree.set(&file, status)?;
+            if let Some(tree) = debug.as_mut() {
+                let status = if scan.best_match >= args.threshold {
+                    FileStatus::Found(scan.path_probability, scan.best_match)
+                } else {
+                    FileStatus::NoMatch(scan.path_probability)
+                };
+                tree.set(&scan.file, status)?;
+            }
         }
     }
 
@@ -169,6 +152,106 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     Ok(())
+}
+
+struct FileScan {
+    file: PathBuf,
+    path_probability: f64,
+    best_match: f64,
+    matches: Vec<String>,
+    unreadable: bool,
+}
+
+fn scan_file(
+    client: &Client,
+    key: &str,
+    args: &Args,
+    file: &Path,
+    path_probability: f64,
+) -> Result<FileScan, String> {
+    let text = match fs::read_to_string(file) {
+        Ok(text) => text,
+        Err(_) => {
+            return Ok(FileScan {
+                file: file.to_path_buf(),
+                path_probability,
+                best_match: 0.0,
+                matches: Vec::new(),
+                unreadable: true,
+            });
+        }
+    };
+    let windows = windows(&text);
+    if windows.is_empty() {
+        return Ok(FileScan {
+            file: file.to_path_buf(),
+            path_probability,
+            best_match: 0.0,
+            matches: Vec::new(),
+            unreadable: false,
+        });
+    }
+
+    let mut best_match: f64 = 0.0;
+    let mut matches = Vec::new();
+    for batch in window_batches(&windows) {
+        let mut questions = serde_json::Map::new();
+        let state_windows: Vec<_> = batch
+            .iter()
+            .enumerate()
+            .map(|(i, window)| {
+                questions.insert(
+                    format!("window_{i}"),
+                    json!({
+                        "type": "noul",
+                        "instructions": format!(
+                            "Does code window window_{i} contain, implement, configure, call, or enforce {}? Return yes only when it is materially relevant.",
+                            args.concept
+                        )
+                    }),
+                );
+                json!({
+                    "id": format!("window_{i}"),
+                    "start_line": window.start,
+                    "end_line": window.end,
+                    "code": window.snippet,
+                })
+            })
+            .collect();
+        let body = json!({
+            "model": args.model,
+            "state": { "file": file.display().to_string(), "windows": state_windows },
+            "questions": questions,
+        });
+        let response = send_jev(client, key, &body)
+            .map_err(|error| format!("{}: {error}", file.display()))?;
+
+        for (i, window) in batch.iter().enumerate() {
+            let answer = response
+                .get("answers")
+                .and_then(|answers| answers.get(format!("window_{i}")))
+                .unwrap_or(&Value::Null);
+            let probability = noul_probability(answer);
+            best_match = best_match.max(probability);
+            if probability >= args.threshold {
+                matches.push(format!(
+                    "{}:{}-{} ({:.0}%)\n{}\n",
+                    file.display(),
+                    window.start,
+                    window.end,
+                    probability * 100.0,
+                    window.snippet
+                ));
+            }
+        }
+    }
+    Ok(FileScan {
+        file: file.to_path_buf(),
+        path_probability,
+        best_match,
+        matches,
+        unreadable: false,
+    })
 }
 
 fn relevant_files(
@@ -199,17 +282,12 @@ fn relevant_files(
             }
         }
 
-        let response: Value = client
-            .post("https://api.typesafe.ai/v1/systemone")
-            .bearer_auth(key)
-            .json(&json!({
-                "model": args.model,
-                "state": { "requested_concept": args.concept },
-                "questions": questions,
-            }))
-            .send()?
-            .error_for_status()?
-            .json()?;
+        let body = json!({
+            "model": args.model,
+            "state": { "requested_concept": args.concept },
+            "questions": questions,
+        });
+        let response = send_jev(client, key, &body).map_err(io::Error::other)?;
 
         for (i, file) in batch.iter().enumerate() {
             let probability = response
@@ -228,6 +306,42 @@ fn relevant_files(
         }
     }
     Ok(relevant)
+}
+
+fn send_jev(client: &Client, key: &str, body: &Value) -> Result<Value, String> {
+    let mut last_error = String::new();
+    for retry in 0..=MAX_RETRIES {
+        match client.post(API_URL).bearer_auth(key).json(body).send() {
+            Ok(response) if response.status().is_success() => match response.json() {
+                Ok(value) => return Ok(value),
+                Err(error) => last_error = format!("invalid response: {error}"),
+            },
+            Ok(response) => {
+                let status = response.status();
+                let detail = response.text().unwrap_or_default();
+                last_error = if detail.is_empty() {
+                    format!("HTTP {status}")
+                } else {
+                    format!("HTTP {status}: {}", detail.chars().take(500).collect::<String>())
+                };
+                if status.as_u16() != 408 && status.as_u16() != 429 && !status.is_server_error() {
+                    return Err(last_error);
+                }
+            }
+            Err(error) => last_error = error.to_string(),
+        }
+        if retry < MAX_RETRIES {
+            thread::sleep(retry_delay(retry));
+        }
+    }
+    Err(format!(
+        "request failed after {} attempts: {last_error}",
+        MAX_RETRIES + 1
+    ))
+}
+
+fn retry_delay(retry: usize) -> Duration {
+    Duration::from_millis(250 * (1 << retry))
 }
 
 enum FileStatus {
@@ -399,19 +513,114 @@ fn is_code_extension(extension: &std::ffi::OsStr) -> bool {
     )
 }
 
-fn windows(text: &str) -> Vec<(usize, usize, String)> {
+struct CodeWindow {
+    start: usize,
+    end: usize,
+    snippet: String,
+}
+
+fn windows(text: &str) -> Vec<CodeWindow> {
     let lines: Vec<&str> = text.lines().collect();
     let mut result = Vec::new();
     let mut start = 0;
     while start < lines.len() {
         let end = (start + WINDOW).min(lines.len());
-        result.push((start + 1, end, lines[start..end].join("\n")));
+        push_bounded_windows(&mut result, &lines[start..end], start + 1);
         if end == lines.len() {
             break;
         }
         start = end.saturating_sub(OVERLAP);
     }
     result
+}
+
+fn push_bounded_windows(result: &mut Vec<CodeWindow>, lines: &[&str], first_line: usize) {
+    let mut snippet = String::new();
+    let mut start = first_line;
+    let mut end = first_line;
+    let mut has_lines = false;
+
+    for (offset, line) in lines.iter().enumerate() {
+        let line_number = first_line + offset;
+        if line.len() > MAX_WINDOW_BYTES {
+            if has_lines {
+                result.push(CodeWindow {
+                    start,
+                    end,
+                    snippet: std::mem::take(&mut snippet),
+                });
+                has_lines = false;
+            }
+            for part in utf8_chunks(line, MAX_WINDOW_BYTES) {
+                result.push(CodeWindow {
+                    start: line_number,
+                    end: line_number,
+                    snippet: part.to_owned(),
+                });
+            }
+            continue;
+        }
+
+        let added = line.len() + usize::from(has_lines);
+        if has_lines && snippet.len() + added > MAX_WINDOW_BYTES {
+            result.push(CodeWindow {
+                start,
+                end,
+                snippet: std::mem::take(&mut snippet),
+            });
+            has_lines = false;
+        }
+        if has_lines {
+            snippet.push('\n');
+        } else {
+            start = line_number;
+        }
+        snippet.push_str(line);
+        end = line_number;
+        has_lines = true;
+    }
+
+    if has_lines {
+        result.push(CodeWindow {
+            start,
+            end,
+            snippet,
+        });
+    }
+}
+
+fn utf8_chunks(mut text: &str, max_bytes: usize) -> Vec<&str> {
+    let mut chunks = Vec::new();
+    while !text.is_empty() {
+        let mut end = text.len().min(max_bytes);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        chunks.push(&text[..end]);
+        text = &text[end..];
+    }
+    chunks
+}
+
+fn window_batches(windows: &[CodeWindow]) -> Vec<&[CodeWindow]> {
+    let mut batches = Vec::new();
+    let mut start = 0;
+    let mut bytes = 0;
+    for (index, window) in windows.iter().enumerate() {
+        if index > start
+            && (index - start >= MAX_WINDOWS_PER_REQUEST
+                || bytes + window.snippet.len() > MAX_REQUEST_SOURCE_BYTES)
+        {
+            batches.push(&windows[start..index]);
+            start = index;
+            bytes = 0;
+        }
+        bytes += window.snippet.len();
+    }
+    if start < windows.len() {
+        batches.push(&windows[start..]);
+    }
+    batches
 }
 
 fn noul_probability(answer: &Value) -> f64 {
@@ -433,8 +642,33 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let result = windows(&text);
-        assert_eq!((result[0].0, result[0].1), (1, 100));
-        assert_eq!((result[1].0, result[1].1), (81, 180));
+        assert_eq!((result[0].start, result[0].end), (1, 100));
+        assert_eq!((result[1].start, result[1].end), (81, 180));
+    }
+
+    #[test]
+    fn large_minified_files_are_split_into_bounded_requests() {
+        let text = "é".repeat(MAX_WINDOW_BYTES * 8);
+        let windows = windows(&text);
+        assert!(windows.len() > 1);
+        assert_eq!(
+            windows
+                .iter()
+                .map(|window| window.snippet.as_str())
+                .collect::<String>(),
+            text
+        );
+        assert!(windows.iter().all(|window| {
+            window.start == 1
+                && window.end == 1
+                && window.snippet.len() <= MAX_WINDOW_BYTES
+                && window.snippet.is_char_boundary(window.snippet.len())
+        }));
+        assert!(window_batches(&windows).iter().all(|batch| {
+            batch.len() <= MAX_WINDOWS_PER_REQUEST
+                && batch.iter().map(|window| window.snippet.len()).sum::<usize>()
+                    <= MAX_REQUEST_SOURCE_BYTES
+        }));
     }
 
     #[test]
@@ -469,5 +703,19 @@ mod tests {
         );
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parallelism_defaults_to_ten() {
+        let args = Args::try_parse_from(["jev-code-finder", "authentication"]).unwrap();
+        assert_eq!(args.parallelism, 10);
+    }
+
+    #[test]
+    fn retries_use_exponential_backoff() {
+        assert_eq!(MAX_RETRIES, 3);
+        assert_eq!(retry_delay(0), Duration::from_millis(250));
+        assert_eq!(retry_delay(1), Duration::from_millis(500));
+        assert_eq!(retry_delay(2), Duration::from_millis(1000));
     }
 }

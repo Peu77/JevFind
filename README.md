@@ -15,10 +15,12 @@ Unlike text search, Jev Code Finder searches for meaning. A query such as `where
 
 1. Walks the repository while respecting `.gitignore` and excluding hidden, dependency, cache, and build directories.
 2. Asks Jev to score each source path for likely relevance to your query.
-3. Opens only paths that meet `--file-threshold` and divides them into overlapping 100-line windows.
-4. Asks Jev which windows are relevant and prints those meeting `--threshold`.
+3. Opens only paths that meet `--file-threshold` and divides them into overlapping, size-bounded code windows.
+4. Sends those windows in bounded request batches, then prints matches meeting `--threshold`.
 
 The path filter keeps unnecessary source code out of later requests and makes large searches cheaper. Set `--file-threshold 0` when recall matters more than speed.
+
+Transient network errors, HTTP 408/429 responses, server errors, and invalid responses are retried up to three times with exponential backoff: 250 ms, 500 ms, then 1 second. Permanent client errors fail immediately.
 
 ## Requirements
 
@@ -61,7 +63,8 @@ Require stronger confidence for both file selection and final matches:
 ```sh
 jev-code-finder "rate limiting" \
   --file-threshold 0.40 \
-  --threshold 0.75
+  --threshold 0.75 \
+  --parallelism 10
 ```
 
 Run without installing:
@@ -102,6 +105,7 @@ Completed files show their path-relevance percentage. Matches additionally show 
 | `--model <MODEL>` | `jev-latest` | TypeSafe model alias |
 | `--debug` | Off | Show the live colored file tree |
 | `--hidden` | Off | Include hidden files and directories |
+| `--parallelism <N>` | `10` | Maximum concurrent file-scanning requests |
 | `-h, --help` | — | Show command help |
 
 Thresholds use decimal probabilities: `0.25` means 25% and `0.80` means 80%.
@@ -146,7 +150,8 @@ No matches found for: where does user JWT authentication happen?
 
 - File selection is probabilistic. A high `--file-threshold` is faster but can exclude unexpectedly named files; lower it or use `0` for a thorough scan.
 - Results are overlapping code windows, not exact AST or function boundaries, so neighboring results may contain duplicate lines.
-- Searches are currently sequential: one request selects batches of paths, followed by one request for each selected file.
+- Large and minified files are split across multiple requests instead of being sent as one oversized payload.
+- Path-selection batches run sequentially; selected files are scanned concurrently up to `--parallelism`.
 - Matching source code and file paths are sent to the TypeSafe API. Review TypeSafe's data policies before searching private or sensitive repositories.
 
 ## Development

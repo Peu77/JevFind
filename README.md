@@ -11,6 +11,21 @@ pub async fn authenticate(...)
 
 Unlike text search, Jev Code Finder searches for meaning. A query such as `where are permissions enforced?` can find middleware, guards, policy checks, and configuration without requiring you to know their exact names.
 
+## Install
+
+Install with Homebrew:
+
+```sh
+brew tap Peu77/tap
+brew install --HEAD jev-code-finder
+```
+
+Install the Agent Skill for coding-agent workflows:
+
+```sh
+npx skills add Peu77/JevFind --skill jev-code-finder
+```
+
 ## How it works
 
 1. Walks the repository while respecting `.gitignore` and excluding hidden, dependency, cache, and build directories.
@@ -166,29 +181,4 @@ Build an optimized binary:
 
 ```sh
 cargo build --release
-```
-
-## Agent skill
-
-This repository includes an Agent Skill for using Jev Code Finder inside coding-agent workflows. Install it from GitHub with:
-
-```sh
-npx skills add Peu77/JevFind --skill jev-code-finder
-```
-
-The skill is compatible with agents supported by the [Vercel skills CLI](https://skills.sh/).
-
-## Homebrew
-
-The repository includes a Homebrew formula at `Formula/jev-code-finder.rb`. Until a Homebrew tap is created, install the current `main` source directly:
-
-```sh
-brew install --HEAD https://raw.githubusercontent.com/Peu77/JevFind/main/Formula/jev-code-finder.rb
-```
-
-For a standard tap command, copy the formula into a `Peu77/homebrew-tap` repository and install it with:
-
-```sh
-brew tap Peu77/tap
-brew install --HEAD jev-code-finder
 ```

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Jev Code Finder"
+  short_description: "Use Jev Code Finder to locate relevant code by concept"
+  default_prompt: "Use Jev Code Finder to locate the files and code windows relevant to this concept."
